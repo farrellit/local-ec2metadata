@@ -24,6 +24,10 @@ func (cm CredentialMaterials)IsExpiringWithin(td time.Duration) bool {
   return time.Now().Add(td).After(cm.Expiration)
 }
 
+func (cm CredentialMaterials)IsExpired() bool {
+  return cm.IsExpiringWithin(0 * time.Second)
+}
+
 type AuthContext interface {
   GetCredentials() (CredentialMaterials, error)
   Renew(string) error
@@ -53,7 +57,11 @@ func (bac *BaseAuthContext)GetParentContext() AuthContext {
 }
 
 func (bac *BaseAuthContext)GetCredentials() (CredentialMaterials, error) {
-  return bac.CredentialMaterials, nil
+  if bac.CredentialMaterials.IsExpired() {
+    return bac.CredentialMaterials, errors.New("Expired")
+  } else {
+    return bac.CredentialMaterials, nil
+  }
 }
 
 func (bac *BaseAuthContext)GetSubContexts() []AuthContext {
@@ -191,8 +199,39 @@ func (as *AuthServer) HandleRequest(req *AuthRequest) AuthResult {
       return as.ListRequest(req)
     case "ADD":
       return as.AddRequest(req)
+    case "CREDS":
+      return as.CredsRequest(req)
+    case "RENEW":
+      return as.RenewRequest(req)
   }
   return AuthResult{ Response:nil, Error:errors.New(fmt.Sprintf("Unknown Operation %s",req.Operation)) }
+}
+
+func (as *AuthServer)CredsRequest(req *AuthRequest) (res AuthResult){
+  if src, err := crawlAuths(req.Path, as.baseAuths); err != nil {
+    res = AuthResult{
+      Response:nil,
+      Error:errors.New(fmt.Sprintf("Failed to find source for CREDS at %s", strings.Join(req.Path,"/"))),
+    }
+  } else {
+    creds, err := src.GetCredentials()
+    res = AuthResult{Response:creds,Error:err}
+  }
+  return
+}
+
+func (as *AuthServer)RenewRequest(req *AuthRequest) (res AuthResult) {
+  if mfa, ok := req.Data.(string); !ok {
+    res = AuthResult{Response:nil,Error: errors.New(fmt.Sprintf("RENEW Request takes an mfa string as Data, not %T", req.Data))}
+  } else if src, err := crawlAuths(req.Path, as.baseAuths); err != nil {
+    res = AuthResult{
+      Response:nil,
+      Error:errors.New(fmt.Sprintf("Failed to find target for RENEW at %s", strings.Join(req.Path,"/"))),
+    }
+  } else {
+    res = AuthResult{Response:nil,Error:src.Renew(mfa)}
+  }
+  return
 }
 
 func (as *AuthServer)AddRequest(req *AuthRequest) AuthResult {
@@ -245,7 +284,7 @@ func crawlAuths(path []string, auths []AuthContext) (AuthContext, error) {
       ids = append(ids, el.ID())
     }
   }
-  return nil, errors.New(fmt.Sprintf("Path element %s not found in %s", path[0], strings.Join(ids,", ")))
+  return nil, errors.New(fmt.Sprintf("Path element %s not found in %s", path[0], strings.Join(ids,"/")))
 }
 
 func (as *AuthServer)DoAuthServer() {
@@ -279,7 +318,10 @@ func main() {
   fmt.Println("MakeRequest complete:", res)
   res = server.MakeRequest(NewAuthRequest([]string{"profile/dod"},"LIST",nil))
   fmt.Println("MakeRequest complete:", res)
-  return
+  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod","profile/farrellit"},"CREDS",nil))
+  fmt.Println("MakeRequest complete:", res)
+  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod"},"RENEW","123456"))
+  fmt.Println("MakeRequest complete:", res)
   return
   //////
   baseAuth := make([]AuthContext, 1)
