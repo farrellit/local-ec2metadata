@@ -1,4 +1,4 @@
-package main
+package authcontext
 
 import (
   "time"
@@ -304,32 +304,3 @@ func NewAuthServer() *AuthServer{
   return as
 }
 
-func main() {
-  server := NewAuthServer()
-  res := server.MakeRequest(NewAuthRequest([]string{},"NOOP", nil))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{},"LIST",nil))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{},"ADD",NewProfileAuthContext("dod")))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod"},"ADD",NewProfileAuthContext("farrellit")))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{},"LIST",nil))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod"},"LIST",nil))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod","profile/farrellit"},"CREDS",nil))
-  fmt.Println("MakeRequest complete:", res)
-  res = server.MakeRequest(NewAuthRequest([]string{"profile/dod"},"RENEW","123456"))
-  fmt.Println("MakeRequest complete:", res)
-  return
-  //////
-  baseAuth := make([]AuthContext, 1)
-  baseAuth[0] = NewProfileAuthContext("dod")
-  mfa := os.Args[1]
-  if err := baseAuth[0].Renew(mfa); err != nil {
-    panic(err)
-  }
-  panic(baseAuth[0].Renew(mfa))
-  fmt.Println(baseAuth[0].GetCredentials())
-}
