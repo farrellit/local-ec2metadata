@@ -9,7 +9,6 @@ import (
   "github.com/aws/aws-sdk-go/aws/session"
   "github.com/aws/aws-sdk-go/service/sts"
   "github.com/aws/aws-sdk-go/service/iam"
-  "os"
   //"regexp"
 )
 
@@ -152,7 +151,7 @@ func NewProfileAuthContext(profile string) *ProfileAuthContext {
     Profile: profile,
   }))
   pac.BaseAuthContext.SubContexts = make([]AuthContext,0)
-  pac.BaseAuthContext.Id = fmt.Sprintf("profile/%s", profile)
+  pac.BaseAuthContext.Id = fmt.Sprintf("profile.%s", profile)
   return pac
 }
 
@@ -187,7 +186,6 @@ type AuthServer struct {
 
 func ( as *AuthServer)MakeRequest(req *AuthRequest) AuthResult {
   as.Requests <- req
-  defer func(){fmt.Println("MakeRequest returned")}()
   return <- req.Result
 }
 
@@ -284,14 +282,13 @@ func crawlAuths(path []string, auths []AuthContext) (AuthContext, error) {
       ids = append(ids, el.ID())
     }
   }
-  return nil, errors.New(fmt.Sprintf("Path element %s not found in %s", path[0], strings.Join(ids,"/")))
+  return nil, errors.New(fmt.Sprintf("Path element '%s' not found in %s", path[0], strings.Join(ids,",")))
 }
 
 func (as *AuthServer)DoAuthServer() {
   for {
     select {
       case req := <-as.Requests:
-        fmt.Printf("Got request op %s\n", req.Operation)
         req.Result <- as.HandleRequest(req)
     }
   }
