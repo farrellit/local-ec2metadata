@@ -1,10 +1,6 @@
 package main
 
 import (
-	/* we only need this if we're gonna read the creds file(s) ourselves.
-	"github.com/go-ini/ini"
-	"github.com/yookoala/realpath"
-	*/
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,25 +12,26 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+  "sync"
 )
 
 // regardless of what kind of CredsContext it is, a CredsContext can AddRole()
-
+// then we can add roles under Profile or Role, whatever, with same code and error handling.
 type CredsContext interface {
 	AddRole(role string) // use current stsCredentials to add a new Role or replace an existing Role
 }
 
 // profile creds contexts provides top level profile based creds,
 // with, or without, mfa.
-
 type ProfileCredsContext struct {
-	sourceSession *session.Session // thinking about how the STS session is managed
-	mfa_serial    string
-	stsSession    *session.Session // this comes from sourceSession I guess?  For assuming subsequent roles?
-	// probably, an interface would be the easiest way to make credentials delivery work the same with profile or role
-	stsCredentials *sts.Credentials
+	sourceSession *session.Session // sessions that don't change are thread safe
 	name           string
-	// SubContexts     []*CredsContext
+	mfa_serial    string // WORM, this never changes after being successfully looked up once.  TODO: Virtual MFA has deterministic name.  Is this a bug for changing hardware MFAs?
+	// probably, an interface would be the easiest way to make credentials delivery work the same with profile or role
+	stsSession    *session.Session // safe without mutex because this is replaced but never modified in place.  
+	stsCredentials *sts.Credentials // safe without mutex because this is replaced but never modified in place.  
+  mux sync.Mutex // all the following MUST be proected with this mutex
+	SubContexts     map[string]*CredsContext
 }
 
 func (pcc *ProfileCredsContext) GetMFASerial() (string, error) {
@@ -73,7 +70,6 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
 		input.TokenCode = aws.String(token)
 	}
 	stsc := sts.New(pcc.sourceSession)
-  fmt.Fprintln(os.Stderr,input)
 	output, err := stsc.GetSessionToken(input)
 	if err == nil {
 		pcc.stsCredentials = output.Credentials
@@ -86,43 +82,71 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
 // how to serve credentials to all the various request goroutines?
 // need to handle concurrency, probably with channel request/response
 // but we have to be congnizant of blocking api calls.
+
 type CredsManager struct {
-	profiles []*ProfileCredsContext
+  mux sync.Mutex
+	profiles map[string]*ProfileCredsContext
 }
 
-/* todo.  This isn't strictly necessary but its awefully convenient
-func CredentialFileSessions(path string) (sessions []*session.Session, err error) {
-  content := ini.Load(realpath.Realpath(path))
-  sessions = make([]*session.Session,0)
-  for sect := content.Sections():
-    print sect
+func NewCredsManager() (cm *CredsManager) {
+  cm = new(CredsManager)
+  cm.profiles = make(map[string]*ProfileCredsContext,0)
+  return
 }
-*/
 
-func authProfile(w http.ResponseWriter, r *http.Request) {
+func (cm *CredsManager)AddProfile(pcc *ProfileCredsContext) error {
+  cm.mux.Lock()
+  defer cm.mux.Unlock()
+  if _, ok := cm.profiles[pcc.name]; ok {
+    return errors.New("Profile '%s' already exists in credentials manager")
+  }
+  cm.profiles[pcc.name] = pcc
+  return nil
+}
+
+func (cm *CredsManager)GetProfile(name string) *ProfileCredsContext {
+  cm.mux.Lock()
+  defer cm.mux.Unlock()
+  if pcc, ok := cm.profiles[name]; ok {
+    return pcc
+  } else {
+    return nil
+  }
+}
+
+func (cm *CredsManager)HandleProfileRequest(w http.ResponseWriter, r *http.Request) {
 	// POST /profiles/<profile name> {"Token": "123456" `optional` }
 	//   -> add new profile to list, get sts credentials (optionally with token)
-	authProfileRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)$")
-	if res := authProfileRegex.FindStringSubmatch(r.URL.Path); res != nil {
-		AddAuthProfile(w, r, res[1])
-		return
-	}
-	// POST /profiles/<profile name>/roles {"Role": "aws:arn:iam:...", "Token": "123456" `optional` }
-	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
-	// authProfileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
-}
-
-func AddAuthProfile(w http.ResponseWriter, r *http.Request, profilename string) {
-	// given a profile name, auth and store in my CredsContext
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusNotImplemented)
-		fmt.Fprintln(w, "this endpoint supports the POST method only")
-		return
-	}
+  // we read this once for chaining 
 	payload, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Failed to load payload from request:", err.Error())
+		return
+	}
+	authProfileRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)$")
+	if res := authProfileRegex.FindStringSubmatch(r.URL.Path); res != nil {
+		cm.PostAuthProfile(w, r, payload, res[1], false)
+		return
+	}
+	// POST /profiles/<profile name>/roles {"Role": [ "aws:arn:iam:..." ... ] , "Token": "123456" `optional` } // we'd auth each role in turn if there were more than one
+	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
+
+	// authProfileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
+  // get profile
+  // add it if it doesn't exist
+  // add use existing stsCredentials to assume role(s) in turn (error clearly if expired or intermediate role fails)
+  // add to profile 
+}
+
+// return value here is for chaining.  
+// it is asumed that `true` means no error, w and r have not been altered 
+func (cm *CredsManager)PostAuthProfile(w http.ResponseWriter, r *http.Request, payload []byte, profilename string, chain bool) (result bool) {
+  result = false
+	// given a profile name, auth and store in my CredsContext
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusNotImplemented)
+		fmt.Fprintln(w, "this endpoint supports the POST method only")
 		return
 	}
 	data := new(struct{ Token string })
@@ -162,6 +186,11 @@ func AddAuthProfile(w http.ResponseWriter, r *http.Request, profilename string) 
 	// todo: remove this!
 	fmt.Fprintln(os.Stderr, pcc.stsCredentials)
 	// todo: add to shared credentialsManager
+  result = true
+  if ! chain { // chaining requires we not write ot our end result
+    w.WriteHeader(http.StatusCreated)
+  }
+  return // success!
 }
 
 func main() {
@@ -169,6 +198,7 @@ func main() {
 		panic(errors.New("AWS_SDK_LOAD_CONFIG _must_ be set in the environment for this to work."))
 		// todo: could we re-exec ourselves I wonder?  Setting with os.Setenv doesn't seem to be enough.
 	}
-	http.HandleFunc("/profiles/", authProfile)
+  cm := NewCredsManager()
+	http.HandleFunc("/profiles/", cm.HandleProfileRequest )
 	panic(http.ListenAndServe(":8081", nil))
 }
