@@ -5,18 +5,24 @@ import (
 	"github.com/go-ini/ini"
 	"github.com/yookoala/realpath"
 	*/
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/aws/aws-sdk-go/service/iam"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"strings"
+	"regexp"
 )
+
+// regardless of what kind of CredsContext it is, a CredsContext can AddRole()
+
+type CredsContext interface {
+	AddRole(role string) // use current stsCredentials to add a new Role or replace an existing Role
+}
 
 // profile creds contexts provides top level profile based creds,
 // with, or without, mfa.
@@ -24,11 +30,10 @@ import (
 type ProfileCredsContext struct {
 	sourceSession *session.Session // thinking about how the STS session is managed
 	mfa_serial    string
-	stsSession    *session.Session // this comes from sourceSession I guess?
-	// probably, an interface would be the easiest way to make credentials
-	// delivery work the same with profile or role
+	stsSession    *session.Session // this comes from sourceSession I guess?  For assuming subsequent roles?
+	// probably, an interface would be the easiest way to make credentials delivery work the same with profile or role
 	stsCredentials *sts.Credentials
-	name            string
+	name           string
 	// SubContexts     []*CredsContext
 }
 
@@ -36,7 +41,7 @@ func (pcc *ProfileCredsContext) GetMFASerial() (string, error) {
 	if pcc.mfa_serial != "" {
 		return pcc.mfa_serial, nil
 	}
-  iamc := iam.New(pcc.sourceSession)
+	iamc := iam.New(pcc.sourceSession)
 	if err := iamc.ListMFADevicesPages(
 		&iam.ListMFADevicesInput{},
 		func(out *iam.ListMFADevicesOutput, more bool) bool {
@@ -68,11 +73,12 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
 		input.TokenCode = aws.String(token)
 	}
 	stsc := sts.New(pcc.sourceSession)
-	output,  err := stsc.GetSessionToken(input)
-  if err == nil {
-    pcc.stsCredentials = output.Credentials
-  }
-  return err
+  fmt.Fprintln(os.Stderr,input)
+	output, err := stsc.GetSessionToken(input)
+	if err == nil {
+		pcc.stsCredentials = output.Credentials
+	}
+	return err
 }
 
 ////// CredentialsManager handles sets of creds contexts hierarchies
@@ -94,14 +100,25 @@ func CredentialFileSessions(path string) (sessions []*session.Session, err error
 */
 
 func authProfile(w http.ResponseWriter, r *http.Request) {
+	// POST /profiles/<profile name> {"Token": "123456" `optional` }
+	//   -> add new profile to list, get sts credentials (optionally with token)
+	authProfileRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)$")
+	if res := authProfileRegex.FindStringSubmatch(r.URL.Path); res != nil {
+		AddAuthProfile(w, r, res[1])
+		return
+	}
+	// POST /profiles/<profile name>/roles {"Role": "aws:arn:iam:...", "Token": "123456" `optional` }
+	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
+	// authProfileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
+}
+
+func AddAuthProfile(w http.ResponseWriter, r *http.Request, profilename string) {
 	// given a profile name, auth and store in my CredsContext
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusNotImplemented)
 		fmt.Fprintln(w, "this endpoint supports the POST method only")
 		return
 	}
-	profilename := strings.TrimPrefix(r.URL.Path, "/profiles/")
-  fmt.Fprintf(os.Stderr, "Path: %s\nProfile: %s\n", r.URL.Path, profilename)
 	payload, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -142,16 +159,16 @@ func authProfile(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Failed to get session credentials:", err.Error())
 		return
 	}
-  // todo: remove this!
-  fmt.Fprintln(os.Stderr, pcc.stsCredentials)
+	// todo: remove this!
+	fmt.Fprintln(os.Stderr, pcc.stsCredentials)
 	// todo: add to shared credentialsManager
 }
 
 func main() {
-  if os.Getenv("AWS_SDK_LOAD_CONFIG") == "" {
-    panic(errors.New("AWS_SDK_LOAD_CONFIG _must_ be set in the environment for this to work."))
-    // todo: could we re-exec ourselves I wonder?  Setting with os.Setenv doesn't seem to be enough.
-  }
+	if os.Getenv("AWS_SDK_LOAD_CONFIG") == "" {
+		panic(errors.New("AWS_SDK_LOAD_CONFIG _must_ be set in the environment for this to work."))
+		// todo: could we re-exec ourselves I wonder?  Setting with os.Setenv doesn't seem to be enough.
+	}
 	http.HandleFunc("/profiles/", authProfile)
 	panic(http.ListenAndServe(":8081", nil))
 }
