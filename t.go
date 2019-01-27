@@ -27,7 +27,6 @@ type ProfileCredsContext struct {
 	sourceSession *session.Session // sessions that don't change are thread safe
 	name           string
 	mfa_serial    string // WORM, this never changes after being successfully looked up once.  TODO: Virtual MFA has deterministic name.  Is this a bug for changing hardware MFAs?
-	// probably, an interface would be the easiest way to make credentials delivery work the same with profile or role
 	stsSession    *session.Session // safe without mutex because this is replaced but never modified in place.  
 	stsCredentials *sts.Credentials // safe without mutex because this is replaced but never modified in place.  
   mux sync.Mutex // all the following MUST be proected with this mutex
@@ -104,14 +103,49 @@ func (cm *CredsManager)AddProfile(pcc *ProfileCredsContext) error {
   return nil
 }
 
-func (cm *CredsManager)GetProfile(name string) *ProfileCredsContext {
+func (cm *CredsManager)ListProfiles() (profiles []string) {
   cm.mux.Lock()
   defer cm.mux.Unlock()
-  if pcc, ok := cm.profiles[name]; ok {
-    return pcc
-  } else {
-    return nil
+  profiles = make([]string,len(cm.profiles))
+  i := 0
+  for k, _ := range(cm.profiles) {
+    profiles[i] = k
+    i++
   }
+  return
+}
+
+func (cm *CredsManager)GetProfile(name string) (pcc *ProfileCredsContext) {
+  cm.mux.Lock()
+  defer cm.mux.Unlock()
+  return cm.profiles[name]
+}
+
+func (cm *CredsManager)GetProfileRequest(w http.ResponseWriter, r *http.Request, payload []byte, profilename string, chain bool) (pcc *ProfileCredsContext) {
+	data := new(struct{Roles []string; Token string})
+	if err := json.Unmarshal(payload, data); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, "This endpoint requires a data payload that is valid JSON.  The request body failed to unmarshal: %s", err.Error())
+		return
+	}
+  pcc = cm.GetProfile(profilename)
+  if( ! chain ){
+    if pcc == nil {
+      w.WriteHeader(http.StatusNotFound)
+      fmt.Fprintln(w,"No such profile",profilename,"has yet been loaded.  This does not necessarily mean it is not defined, and will be loaded automatically if used for a role")
+      return
+    }
+    result := new(struct{Name string}) // more fields? separate with ;
+    result.Name=pcc.name
+    if data, err := json.Marshal(result); err != nil {
+      w.WriteHeader(http.StatusInternalServerError)
+      fmt.Fprintln(w,"Couldn't marshal result (this is a server-side programming error):", err.Error)
+    } else {
+      w.Header().Set("Content-Type", "application/json")
+      fmt.Fprintln(w,data)
+    }
+  }
+  return
 }
 
 func (cm *CredsManager)HandleProfileRequest(w http.ResponseWriter, r *http.Request) {
@@ -126,8 +160,16 @@ func (cm *CredsManager)HandleProfileRequest(w http.ResponseWriter, r *http.Reque
 	}
 	authProfileRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)$")
 	if res := authProfileRegex.FindStringSubmatch(r.URL.Path); res != nil {
-		cm.PostAuthProfile(w, r, payload, res[1], false)
-		return
+    if r.Method == "POST" {
+		  cm.PostProfileHandler(w, r, payload, res[1], false)
+		  return
+    } else if r.Method == "GET" {
+    
+    }else {
+		  w.WriteHeader(http.StatusNotImplemented)
+		  fmt.Fprintln(w, "this endpoint supports the POST method only")
+		  return
+    }
 	}
 	// POST /profiles/<profile name>/roles {"Role": [ "aws:arn:iam:..." ... ] , "Token": "123456" `optional` } // we'd auth each role in turn if there were more than one
 	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
@@ -141,14 +183,9 @@ func (cm *CredsManager)HandleProfileRequest(w http.ResponseWriter, r *http.Reque
 
 // return value here is for chaining.  
 // it is asumed that `true` means no error, w and r have not been altered 
-func (cm *CredsManager)PostAuthProfile(w http.ResponseWriter, r *http.Request, payload []byte, profilename string, chain bool) (result bool) {
+func (cm *CredsManager)PostProfileHandler(w http.ResponseWriter, r *http.Request, payload []byte, profilename string, chain bool) (result bool) {
   result = false
 	// given a profile name, auth and store in my CredsContext
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusNotImplemented)
-		fmt.Fprintln(w, "this endpoint supports the POST method only")
-		return
-	}
 	data := new(struct{ Token string })
 	if err := json.Unmarshal(payload, data); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -162,7 +199,7 @@ func (cm *CredsManager)PostAuthProfile(w http.ResponseWriter, r *http.Request, p
 		fmt.Fprintf(w, "Failed to load session from profile '%s': '%s'\n", profilename, err.Error())
 		return
 	}
-	pcc := ProfileCredsContext{
+	pcc := &ProfileCredsContext{
 		sourceSession: profile_session,
 		name:          profilename,
 	}
@@ -185,7 +222,11 @@ func (cm *CredsManager)PostAuthProfile(w http.ResponseWriter, r *http.Request, p
 	}
 	// todo: remove this!
 	fmt.Fprintln(os.Stderr, pcc.stsCredentials)
-	// todo: add to shared credentialsManager
+	if err := cm.AddProfile(pcc); err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    fmt.Fprintln(w,"Failed to add profile to credsManager:", err.Error())
+    return
+  }
   result = true
   if ! chain { // chaining requires we not write ot our end result
     w.WriteHeader(http.StatusCreated)
