@@ -122,12 +122,14 @@ func (cm *CredsManager)GetProfile(name string) (pcc *ProfileCredsContext) {
 }
 
 func (cm *CredsManager)GetProfileRequest(w http.ResponseWriter, r *http.Request, payload []byte, profilename string, chain bool) (pcc *ProfileCredsContext) {
-	data := new(struct{Roles []string; Token string})
+  /* 
+  data := new(struct{Roles []string; Token string})
 	if err := json.Unmarshal(payload, data); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintln(w, "This endpoint requires a data payload that is valid JSON.  The request body failed to unmarshal: %s", err.Error())
 		return
 	}
+  */
   pcc = cm.GetProfile(profilename)
   if( ! chain ){
     if pcc == nil {
@@ -142,7 +144,7 @@ func (cm *CredsManager)GetProfileRequest(w http.ResponseWriter, r *http.Request,
       fmt.Fprintln(w,"Couldn't marshal result (this is a server-side programming error):", err.Error)
     } else {
       w.Header().Set("Content-Type", "application/json")
-      fmt.Fprintln(w,data)
+      fmt.Fprintln(w,string(data))
     }
   }
   return
@@ -164,7 +166,8 @@ func (cm *CredsManager)HandleProfileRequest(w http.ResponseWriter, r *http.Reque
 		  cm.PostProfileHandler(w, r, payload, res[1], false)
 		  return
     } else if r.Method == "GET" {
-    
+      cm.GetProfileRequest(w,r,payload,res[1],false)
+      return
     }else {
 		  w.WriteHeader(http.StatusNotImplemented)
 		  fmt.Fprintln(w, "this endpoint supports the POST method only")
