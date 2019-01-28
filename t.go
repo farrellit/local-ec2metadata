@@ -44,6 +44,7 @@ func (tcp *TempCredentialsProvider) Retrieve() (credentials.Value, error) {
 // credentials.  
 type CredsContext interface {
   AddRoles([]string) error // recursive (across objects) function; returns new_role_context.AddRoles(myroles[1:])
+  GetMetadataCredentials([]string) (*MetadataResponse, error) // for metadata requests
 }
 
 type BaseCredsContext struct {
@@ -52,6 +53,49 @@ type BaseCredsContext struct {
 	stsSession     *session.Session         // this is a session from the stsCredentials.
 	mux            sync.Mutex               // all the following MUST be protected with this mutex
   subContexts map[string]CredsContext // role arn -> credsContext
+}
+
+type MetadataResponse struct {
+  Code string
+  LastUpdated string
+  Type string // "AWS-HMAC"
+  AccessKeyId string
+  SecretAccessKey string
+  Token string
+  Expiration string // "2017-05-17T15:09:54Z"
+}
+
+func (bcc *BaseCredsContext)GetMetadataCredentials(path []string) (*MetadataResponse, error) {
+  if len(path) > 0 {
+    bcc.mux.Lock()
+    subc, ok := bcc.subContexts[path[0]]
+    bcc.mux.Unlock()
+    if ok {
+      return subc.GetMetadataCredentials(path[1:])
+    } else {
+      return nil, fmt.Errorf("Role %s not found under %s", path[0], bcc.name)
+    }
+  }
+  /* todo: debug
+  vexp, err := bcc.stsCredentials.ExpiresAt()
+  if err != nil { // TODO: make this work for profiles if it doesn't already, so they can be exposed too if desired
+    return nil, fmt.Errorf("Role %s: Failed to get stsCredentials.ExpiresAt : %s", bcc.name, err.Error())
+  }
+  */
+  v, err := bcc.stsCredentials.Get()
+  if err != nil {
+    return nil, err
+  }
+  time_format := "2006-01-02T15:04:05Z"
+  return &MetadataResponse{
+    Code: "SUCCESS",
+    LastUpdated: time.Now().UTC().Format(time_format), //How might we know this ... ?
+    Type: "AWS-HMAC",
+    AccessKeyId: v.AccessKeyID,
+    SecretAccessKey: v.SecretAccessKey,
+    Token: v.SessionToken,
+    Expiration: time.Now().UTC().Format(time_format), //vexp.Format(time_format),
+  }, nil
 }
 
 func (bcc *BaseCredsContext) AddRoles(roles []string) error {
@@ -225,6 +269,7 @@ func (cm *CredsManager) HandleProfileRequest(w http.ResponseWriter, r *http.Requ
 		fmt.Fprintln(w, "Failed to load payload from request:", err.Error())
 		return
 	}
+	profileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
 	// POST /profiles/<profile name>/roles {"Roles": [ "aws:arn:iam:..." ... ] , "Token": "123456" `optional` }
 	// we'd auth each role in turn
 	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
@@ -270,7 +315,6 @@ func (cm *CredsManager) PostProfileRole(w http.ResponseWriter, r *http.Request, 
 	}
 	var pcc *ProfileCredsContext
 	if pcc = cm.GetProfile(profilename); pcc == nil {
-		fmt.Fprintf(os.Stderr, "cm.PostProfileRow(): cm.GetProfile '%s' returned nil\n", profilename)
 		// add it if it doesn't exist
 		if cm.PostProfileHandler(w, r, payload, profilename, true) == false {
 			return // PostProfileHandler handled our errors already
@@ -316,7 +360,7 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 		fmt.Fprintln(w, "This endpoint requires a data payload that is valid JSON.  The request body failed to unmarshal: %s", err.Error())
 		return
 	}
-	fmt.Fprintf(os.Stderr, "POST to profile name '%s' payload is:\n%s\nData is %s\n", profilename, payload, data)
+	// fmt.Fprintf(os.Stderr, "POST to profile name '%s' payload is:\n%s\nata is %s\n", profilename, payload, data)
 	profile_session, err := session.NewSessionWithOptions(session.Options{Profile: profilename})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
