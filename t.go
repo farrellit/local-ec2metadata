@@ -18,40 +18,41 @@ import (
 	"time"
 )
 
-// regardless of what kind of CredsContext it is, a CredsContext can AddRole()
-// then we can add roles under Profile or Role, whatever, with same code and error handling.
+// this implements credentials.SessionProvider with sts.Credentials source
+// it doesn't refresh properly of course ... it would probably need a token for that 
+type TempCredentialsProvider struct {
+	stsCreds *sts.Credentials
+}
+
+func (tcp *TempCredentialsProvider) IsExpired() bool {
+	return tcp.stsCreds.Expiration.Before(time.Now())
+}
+
+func (tcp *TempCredentialsProvider) Retrieve() (credentials.Value, error) {
+	if tcp.IsExpired() {
+		return credentials.Value{}, errors.New("Session Token Credentials have expired")
+	}
+	return credentials.Value{
+		AccessKeyID:     aws.StringValue(tcp.stsCreds.AccessKeyId),
+		SecretAccessKey: aws.StringValue(tcp.stsCreds.SecretAccessKey),
+		SessionToken:    aws.StringValue(tcp.stsCreds.SessionToken),
+		ProviderName:    "TempCredentialsProvider",
+	}, nil
+}
+
+// CredsContext objects provide a way of delegating credentials through a hierarchy.
+// credentials.  
 type CredsContext interface {
-	AddRole(role string) error // use current stsCredentials to add a new Role or replace an existing Role under the arn
-	Roles() []string
-}
+} /// what needs here? everything called on BaseCredsContext in a generic place I think
 
-/* //// RoleCredsContext    /////
-
-This type represents credentials from a role, and always have a credentials source other than itself.   The
-credentials providers must be chosen carefully so the cascading effect happens automatically when possible. I intuit that to be possible ... we'll see.
-
-*/
-
-// starting to realize this is exactly the same as ProfileCredsContext .. the only diffrence is whether it's AssumeRole or GetSessionToken.
-// we could track that.  Let's come back to this later... we may never have to .
-
-/*
-type RoleCredsContext struct {
+type BaseCredsContext struct {
   name string
-  sts.Credentials sts.Credentials // this is for the metadata endpoint primarily
-  stsCre
-  sourceSession *session.Session     // this provides the recursive nature.  The first role in a hierarchy will be based on the profile.  The rest, on the previous role.
-                          // Renewal up the tree should be automatic, assuming the parent role didn't expire or is renewed.
-                          // NOTE: renewed roles should be available to the child.  Thus a pointer share might not be sufficient.
-                          //   Perhaps the parent could pass it down preemtively when
-                          //   changed.
-  subContexts map[string]*CredsContext
+  stsCredentials *sts.Credentials // this is for the metadata endpoint primarily
+	stsSession     *session.Session         // this is a session from the stsCredentials.
+  sourceSession *session.Session
+	mux            sync.Mutex               // all the following MUST be protected with this mutex
+  subContexts map[string]*CredsContext // role arn -> credsContext
 }
-
-func (rcc *RoleCredsContext)AddRole(role string) error {
-  // create a new role cred pointing back to this cred,
-}
-*/
 
 /* //// ProfileCredsContext /////
 
@@ -62,13 +63,8 @@ provided for by a previous
 
 */
 type ProfileCredsContext struct {
-	sourceSession  *session.Session // sessions that don't change are thread safe.  This one represents the original profile.  will it be reread if file changes?
-	name           string
-	mfa_serial     string                   // WORM, this never changes after being successfully looked up once.  TODO: Virtual MFA has deterministic name.  Is this a bug for changing hardware MFAs?
-	stsSession     *session.Session         // this is a session from the stsCredentials.
-	stsCredentials *sts.Credentials         // safe without mutex because this is replaced but never modified in place.
-	mux            sync.Mutex               // all the following MUST be protected with this mutex
-	subContexts    map[string]*CredsContext // map ARN to RoleCredsContexts
+  BaseCredsContext
+	mfa_serial     string
 }
 
 func (pcc *ProfileCredsContext) GetMFASerial() (string, error) {
@@ -91,25 +87,6 @@ func (pcc *ProfileCredsContext) GetMFASerial() (string, error) {
 	return pcc.mfa_serial, nil
 }
 
-type TempCredentialsProvider struct {
-	stsCreds *sts.Credentials
-}
-
-func (tcp *TempCredentialsProvider) IsExpired() bool {
-	return tcp.stsCreds.Expiration.Before(time.Now())
-}
-
-func (tcp *TempCredentialsProvider) Retrieve() (credentials.Value, error) {
-	if tcp.IsExpired() {
-		return credentials.Value{}, errors.New("Session Token Credentials have expired")
-	}
-	return credentials.Value{
-		AccessKeyID:     aws.StringValue(tcp.stsCreds.AccessKeyId),
-		SecretAccessKey: aws.StringValue(tcp.stsCreds.SecretAccessKey),
-		SessionToken:    aws.StringValue(tcp.stsCreds.SessionToken),
-		ProviderName:    "TempCredentialsProvider",
-	}, nil
-}
 
 func (pcc *ProfileCredsContext) STSSession(token string) error {
 	input := &sts.GetSessionTokenInput{
@@ -301,8 +278,10 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	pcc := &ProfileCredsContext{
-		sourceSession: profile_session,
-		name:          profilename,
+		BaseCredsContext: BaseCredsContext{
+      sourceSession: profile_session,
+      name:          profilename,
+   },
 	}
 	if data.Token != "" {
 		mfa_serial, err := pcc.GetMFASerial()
