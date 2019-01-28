@@ -43,15 +43,50 @@ func (tcp *TempCredentialsProvider) Retrieve() (credentials.Value, error) {
 // CredsContext objects provide a way of delegating credentials through a hierarchy.
 // credentials.  
 type CredsContext interface {
-} /// what needs here? everything called on BaseCredsContext in a generic place I think
+  AddRoles([]string) error // recursive (across objects) function; returns new_role_context.AddRoles(myroles[1:])
+}
 
 type BaseCredsContext struct {
   name string
-  stsCredentials *sts.Credentials // this is for the metadata endpoint primarily
+  stsCredentials *credentials.Credentials // this is for the metadata endpoint primarily, from .Get() which will autorenew, and .ExpiresAt() tells when it expires if that's missing
 	stsSession     *session.Session         // this is a session from the stsCredentials.
-  sourceSession *session.Session
 	mux            sync.Mutex               // all the following MUST be protected with this mutex
-  subContexts map[string]*CredsContext // role arn -> credsContext
+  subContexts map[string]CredsContext // role arn -> credsContext
+}
+
+func (bcc *BaseCredsContext) AddRoles(roles []string) error {
+  if len(roles) == 0 {
+    return nil
+  }
+  first_role := roles[0]
+  bcc.mux.Lock()
+  existing_role_cxt, ok := bcc.subContexts[first_role]
+  bcc.mux.Unlock()
+  if ok {
+    return existing_role_cxt.AddRoles(roles[1:])
+  }
+  credentials := stscreds.NewCredentials(bcc.stsSession,first_role)
+  sess, err := session.NewSession(&aws.Config{Credentials: credentials})
+  if err != nil {
+    return err
+  }
+  new_context := &BaseCredsContext{
+      name: first_role,
+      stsSession: sess,
+      stsCredentials: credentials,
+      subContexts:   make(map[string]CredsContext),
+  }
+  bcc.mux.Lock()
+  bcc.subContexts[first_role] = new_context
+  bcc.mux.Unlock()
+	stsc := sts.New(new_context.stsSession)
+	out, err := stsc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+	fmt.Fprintln(os.Stderr, out)
+	fmt.Fprintln(os.Stderr, err)
+  if err != nil {
+    return err
+  }
+  return new_context.AddRoles(roles[1:])
 }
 
 /* //// ProfileCredsContext /////
@@ -65,6 +100,7 @@ provided for by a previous
 type ProfileCredsContext struct {
   BaseCredsContext
 	mfa_serial     string
+  sourceSession *session.Session // we only need this here I guess
 }
 
 func (pcc *ProfileCredsContext) GetMFASerial() (string, error) {
@@ -107,13 +143,11 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
 	output, err := stsc.GetSessionToken(input)
 	if err == nil {
 		// be on the lookout for a race condition if we ever assume these to be conjoined atomically
+    pcc.stsCredentials = credentials.NewCredentials(&TempCredentialsProvider{output.Credentials})
 		pcc.stsSession = session.Must(session.NewSession(
 			pcc.sourceSession.Config,
-			&aws.Config{
-				Credentials: credentials.NewCredentials(&TempCredentialsProvider{output.Credentials}),
-			},
+			&aws.Config{ Credentials: pcc.stsCredentials},
 		))
-		pcc.stsCredentials = output.Credentials
 	}
 	return err
 }
@@ -239,14 +273,21 @@ func (cm *CredsManager) PostProfileRole(w http.ResponseWriter, r *http.Request, 
 		fmt.Fprintf(os.Stderr, "cm.PostProfileRow(): cm.GetProfile '%s' returned nil\n", profilename)
 		// add it if it doesn't exist
 		if cm.PostProfileHandler(w, r, payload, profilename, true) == false {
-			return // we'll let PostProfileHandler handle our errors here
+			return // PostProfileHandler handled our errors already
 		}
 		pcc = cm.GetProfile(profilename) // this is guaranteed to work now I think
 	} else {
-		// TODO: refresh pcc from token if included
+		// TODO: refresh pcc from token if included 
+    // BUG: if this isn't done, even without expiry, a non-mfa session will block additional attempts w/ token
 	}
 	// add use existing stsCredentials to assume role(s) in turn (error clearly if expired or intermediate role fails)
-	source_session := pcc.stsSession
+	err := pcc.AddRoles(data.Roles)
+  if err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    fmt.Fprintln(w,"Failed to add provided roles:", err.Error())
+    return
+  }
+  /*
 	for _, role_arn := range data.Roles {
 		role_session, err := session.NewSession(&aws.Config{Credentials: stscreds.NewCredentials(source_session, role_arn)})
 		stsc := sts.New(role_session)
@@ -256,6 +297,11 @@ func (cm *CredsManager) PostProfileRole(w http.ResponseWriter, r *http.Request, 
 		// todo: storage, etc
 		source_session = role_session
 	}
+  */
+  result = true
+  if !chain {
+    fmt.Fprintln(w,"Roles Added")
+  }
 	return
 }
 
@@ -279,9 +325,10 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 	}
 	pcc := &ProfileCredsContext{
 		BaseCredsContext: BaseCredsContext{
-      sourceSession: profile_session,
       name:          profilename,
+      subContexts:   make(map[string]CredsContext),
    },
+   sourceSession: profile_session,
 	}
 	if data.Token != "" {
 		mfa_serial, err := pcc.GetMFASerial()
