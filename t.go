@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sync"
 	"time"
+  "net"
 )
 
 // this implements credentials.SessionProvider with sts.Credentials source
@@ -45,6 +46,7 @@ func (tcp *TempCredentialsProvider) Retrieve() (credentials.Value, error) {
 type CredsContext interface {
   AddRoles([]string) error // recursive (across objects) function; returns new_role_context.AddRoles(myroles[1:])
   GetMetadataCredentials([]string) (*MetadataResponse, error) // for metadata requests
+  Update(*session.Session) error
 }
 
 type BaseCredsContext struct {
@@ -55,47 +57,39 @@ type BaseCredsContext struct {
   subContexts map[string]CredsContext // role arn -> credsContext
 }
 
-type MetadataResponse struct {
-  Code string
-  LastUpdated string
-  Type string // "AWS-HMAC"
-  AccessKeyId string
-  SecretAccessKey string
-  Token string
-  Expiration string // "2017-05-17T15:09:54Z"
+func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
+  /* if source_sess == nil {
+    return fmt.Errorf("%s: couldn't update: source_sess was nil", bcc.name)
+  } */
+  credentials := stscreds.NewCredentials(source_sess,bcc.name)
+  sess, err := session.NewSession(&aws.Config{Credentials: credentials})
+  if err != nil {
+    return err
+  }
+  bcc.mux.Lock()
+  bcc.stsSession = sess
+  bcc.stsCredentials = credentials
+  bcc.mux.Unlock()
+  return bcc.UpdateChildren()
 }
 
-func (bcc *BaseCredsContext)GetMetadataCredentials(path []string) (*MetadataResponse, error) {
-  if len(path) > 0 {
-    bcc.mux.Lock()
-    subc, ok := bcc.subContexts[path[0]]
-    bcc.mux.Unlock()
-    if ok {
-      return subc.GetMetadataCredentials(path[1:])
-    } else {
-      return nil, fmt.Errorf("Role %s not found under %s", path[0], bcc.name)
+func (bcc *BaseCredsContext) UpdateChildren() error {
+  if bcc.stsSession == nil {
+    return nil
+  }
+  children := make([]CredsContext,len(bcc.subContexts))
+  i:=0
+  bcc.mux.Lock()
+  for _, child := range bcc.subContexts {
+    children[i] = child
+  }
+  bcc.mux.Unlock()
+  for _, child := range children {
+    if err := child.Update(bcc.stsSession); err != nil {
+      return err
     }
   }
-  /* todo: debug
-  vexp, err := bcc.stsCredentials.ExpiresAt()
-  if err != nil { // TODO: make this work for profiles if it doesn't already, so they can be exposed too if desired
-    return nil, fmt.Errorf("Role %s: Failed to get stsCredentials.ExpiresAt : %s", bcc.name, err.Error())
-  }
-  */
-  v, err := bcc.stsCredentials.Get()
-  if err != nil {
-    return nil, err
-  }
-  time_format := "2006-01-02T15:04:05Z"
-  return &MetadataResponse{
-    Code: "SUCCESS",
-    LastUpdated: time.Now().UTC().Format(time_format), //How might we know this ... ?
-    Type: "AWS-HMAC",
-    AccessKeyId: v.AccessKeyID,
-    SecretAccessKey: v.SecretAccessKey,
-    Token: v.SessionToken,
-    Expiration: time.Now().UTC().Format(time_format), //vexp.Format(time_format),
-  }, nil
+  return nil
 }
 
 func (bcc *BaseCredsContext) AddRoles(roles []string) error {
@@ -109,27 +103,22 @@ func (bcc *BaseCredsContext) AddRoles(roles []string) error {
   if ok {
     return existing_role_cxt.AddRoles(roles[1:])
   }
-  credentials := stscreds.NewCredentials(bcc.stsSession,first_role)
-  sess, err := session.NewSession(&aws.Config{Credentials: credentials})
-  if err != nil {
-    return err
-  }
   new_context := &BaseCredsContext{
       name: first_role,
-      stsSession: sess,
-      stsCredentials: credentials,
       subContexts:   make(map[string]CredsContext),
   }
+  if err := new_context.Update(bcc.stsSession); err != nil {
+    return fmt.Errorf("Couldn't update session for new role '%s': %s", first_role, err.Error())
+  }
+	stsc := sts.New(new_context.stsSession)
+	out, err := stsc.GetCallerIdentity(&sts.GetCallerIdentityInput{}) // idk if I love this sync call, but it proves we have assumed for sure
+  if err != nil {
+    return fmt.Errorf("Couldn't GetCallerIdentity on role %s: %s", new_context.name, err.Error())
+  }
+	fmt.Fprintln(os.Stderr, out)
   bcc.mux.Lock()
   bcc.subContexts[first_role] = new_context
   bcc.mux.Unlock()
-	stsc := sts.New(new_context.stsSession)
-	out, err := stsc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
-	fmt.Fprintln(os.Stderr, out)
-	fmt.Fprintln(os.Stderr, err)
-  if err != nil {
-    return err
-  }
   return new_context.AddRoles(roles[1:])
 }
 
@@ -185,26 +174,47 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
 	}
 	stsc := sts.New(pcc.sourceSession)
 	output, err := stsc.GetSessionToken(input)
-	if err == nil {
-		// be on the lookout for a race condition if we ever assume these to be conjoined atomically
-    pcc.stsCredentials = credentials.NewCredentials(&TempCredentialsProvider{output.Credentials})
-		pcc.stsSession = session.Must(session.NewSession(
-			pcc.sourceSession.Config,
-			&aws.Config{ Credentials: pcc.stsCredentials},
-		))
-	}
-	return err
+	if err != nil {
+    return err
+  }
+  creds := credentials.NewCredentials(&TempCredentialsProvider{output.Credentials})
+	sess,err := session.NewSession( pcc.sourceSession.Config, &aws.Config{ Credentials: pcc.stsCredentials},)
+  if err != nil {
+    return err
+  }
+  pcc.mux.Lock()
+  pcc.stsCredentials = creds
+	pcc.stsSession = sess
+  pcc.mux.Unlock()
+	return pcc.UpdateChildren()
 }
 
 ////// CredentialsManager handles sets of creds contexts hierarchies
 
-// how to serve credentials to all the various request goroutines?
-// need to handle concurrency, probably with channel request/response
-// but we have to be congnizant of blocking api calls.
+// it's responsible for handling profile web requests too
 
 type CredsManager struct {
 	mux      sync.Mutex
 	profiles map[string]*ProfileCredsContext
+}
+
+func (cm *CredsManager)Allowed(r *http.Request) (allowed bool) {
+  allowed = false
+  host, port, err := net.SplitHostPort(r.RemoteAddr)
+  if err != nil {
+    panic(err)
+  }
+  if host == "169.254.169.254" || host == "127.0.0.1" || host == "::1" { // local request
+   allowed = true
+  }
+  defer func() {
+    if !allowed {
+      fmt.Fprintf(os.Stderr, "%s - Host %s port %s forbidden.\n", r.RemoteAddr, host, port)
+    }
+  }()
+  //todo: allow docker selectively or map docker matches somehow 
+  // (expose underlying docker query format?) to decide whether to allow
+  return
 }
 
 func NewCredsManager() (cm *CredsManager) {
@@ -263,17 +273,21 @@ func (cm *CredsManager) GetProfileRequest(w http.ResponseWriter, r *http.Request
 }
 
 func (cm *CredsManager) HandleProfileRequest(w http.ResponseWriter, r *http.Request) {
+  if ! cm.Allowed(r) {
+    w.WriteHeader(http.StatusForbidden)
+    fmt.Fprintln(w, r.RemoteAddr)
+    return
+  }
 	payload, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Failed to load payload from request:", err.Error())
 		return
 	}
-	profileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
 	// POST /profiles/<profile name>/roles {"Roles": [ "aws:arn:iam:..." ... ] , "Token": "123456" `optional` }
 	// we'd auth each role in turn
 	//   -> assume new role under profile, add to list, with current sts credentials (or with new sts creds with token)
-	profileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles$")
+	profileRoleRegex := regexp.MustCompile("^/profiles/(?P<profile_name>.+)/roles/*$")
 	if res := profileRoleRegex.FindStringSubmatch(r.URL.Path); res != nil {
 		if r.Method == "POST" {
 			cm.PostProfileRole(w, r, payload, res[1], false)
@@ -321,8 +335,12 @@ func (cm *CredsManager) PostProfileRole(w http.ResponseWriter, r *http.Request, 
 		}
 		pcc = cm.GetProfile(profilename) // this is guaranteed to work now I think
 	} else {
-		// TODO: refresh pcc from token if included 
-    // BUG: if this isn't done, even without expiry, a non-mfa session will block additional attempts w/ token
+    if data.Token != "" {
+      // we only refresh if we have a new token ( otherwise lack of token might refresh atop a cached creds from token)
+		  if cm.PostProfileHandler(w, r, payload, profilename, true) == false {
+        return
+      }
+    }
 	}
 	// add use existing stsCredentials to assume role(s) in turn (error clearly if expired or intermediate role fails)
 	err := pcc.AddRoles(data.Roles)
@@ -331,17 +349,6 @@ func (cm *CredsManager) PostProfileRole(w http.ResponseWriter, r *http.Request, 
     fmt.Fprintln(w,"Failed to add provided roles:", err.Error())
     return
   }
-  /*
-	for _, role_arn := range data.Roles {
-		role_session, err := session.NewSession(&aws.Config{Credentials: stscreds.NewCredentials(source_session, role_arn)})
-		stsc := sts.New(role_session)
-		out, err := stsc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
-		fmt.Fprintln(w, out)
-		fmt.Fprintln(w, err)
-		// todo: storage, etc
-		source_session = role_session
-	}
-  */
   result = true
   if !chain {
     fmt.Fprintln(w,"Roles Added")
@@ -361,19 +368,28 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	// fmt.Fprintf(os.Stderr, "POST to profile name '%s' payload is:\n%s\nata is %s\n", profilename, payload, data)
-	profile_session, err := session.NewSessionWithOptions(session.Options{Profile: profilename})
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Failed to load session from profile '%s': '%s'\n", profilename, err.Error())
-		return
-	}
-	pcc := &ProfileCredsContext{
-		BaseCredsContext: BaseCredsContext{
-      name:          profilename,
-      subContexts:   make(map[string]CredsContext),
-   },
-   sourceSession: profile_session,
-	}
+  var pcc *ProfileCredsContext
+  var already_added bool // flag so we know not to add to cm.Profiles again.
+  if pcc = cm.GetProfile(profilename); pcc == nil {
+    already_added = false
+    // okay, it doesn't exist already, continue
+	  profile_session, err := session.NewSessionWithOptions(session.Options{Profile: profilename})
+	  if err != nil {
+		  w.WriteHeader(http.StatusInternalServerError)
+		  fmt.Fprintf(w, "Failed to load session from profile '%s': '%s'\n", profilename, err.Error())
+		  return
+	  }
+	  pcc = &ProfileCredsContext{
+		  BaseCredsContext: BaseCredsContext{
+        name:          profilename,
+        subContexts:   make(map[string]CredsContext),
+      },
+      sourceSession: profile_session,
+	  }
+  } else {
+    // if it exists already we have only to update the session token and kickoff an update to the tree of roles to update their sessions as well
+    already_added = true
+  }
 	if data.Token != "" {
 		mfa_serial, err := pcc.GetMFASerial()
 		if err != nil {
@@ -386,23 +402,29 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	if err = pcc.STSSession(data.Token); err != nil {
+	if err := pcc.STSSession(data.Token); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Failed to get session credentials:", err.Error())
 		return
 	}
-	// todo: remove this!
-	fmt.Fprintln(os.Stderr, pcc.stsCredentials)
-	if err := cm.AddProfile(pcc); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, "Failed to add profile to credsManager:", err.Error())
-		return
-	}
+	fmt.Fprintln(os.Stderr, pcc.stsCredentials) // TODO: remove this dump of creds!
+  if ! already_added {
+	  if err := cm.AddProfile(pcc); err != nil {
+		  w.WriteHeader(http.StatusInternalServerError)
+		  fmt.Fprintln(w, "Failed to add profile to credsManager:", err.Error())
+		  return
+	  }
+  }
 	result = true
 	if !chain { // chaining requires we not write ot our end result
-		w.WriteHeader(http.StatusCreated)
+    if ! already_added {
+		  w.WriteHeader(http.StatusCreated)
+    } else {
+      w.WriteHeader(http.StatusOK)
+    }
 	}
-	return // success!
+  fmt.Fprintf(os.Stderr, "%#v: result %s already_added %b\n", pcc, result, already_added)
+	return // success! result has been set to true already.
 }
 
 func main() {
@@ -414,3 +436,49 @@ func main() {
 	http.HandleFunc("/profiles/", cm.HandleProfileRequest)
 	panic(http.ListenAndServe(":8081", nil))
 }
+
+// MetadtatResponse 
+
+type MetadataResponse struct {
+  Code string
+  LastUpdated string
+  Type string // "AWS-HMAC"
+  AccessKeyId string
+  SecretAccessKey string
+  Token string
+  Expiration string // "2017-05-17T15:09:54Z"
+}
+
+func (bcc *BaseCredsContext)GetMetadataCredentials(path []string) (*MetadataResponse, error) {
+  if len(path) > 0 {
+    bcc.mux.Lock()
+    subc, ok := bcc.subContexts[path[0]]
+    bcc.mux.Unlock()
+    if ok {
+      return subc.GetMetadataCredentials(path[1:])
+    } else {
+      return nil, fmt.Errorf("Role %s not found under %s", path[0], bcc.name)
+    }
+  }
+  /* todo: debug
+  vexp, err := bcc.stsCredentials.ExpiresAt()
+  if err != nil { // TODO: make this work for profiles if it doesn't already, so they can be exposed too if desired
+    return nil, fmt.Errorf("Role %s: Failed to get stsCredentials.ExpiresAt : %s", bcc.name, err.Error())
+  }
+  */
+  v, err := bcc.stsCredentials.Get()
+  if err != nil {
+    return nil, err
+  }
+  time_format := "2006-01-02T15:04:05Z"
+  return &MetadataResponse{
+    Code: "SUCCESS",
+    LastUpdated: time.Now().UTC().Format(time_format), //How might we know this ... ?
+    Type: "AWS-HMAC",
+    AccessKeyId: v.AccessKeyID,
+    SecretAccessKey: v.SecretAccessKey,
+    Token: v.SessionToken,
+    Expiration: time.Now().UTC().Format(time_format), //vexp.Format(time_format),
+  }, nil
+}
+
