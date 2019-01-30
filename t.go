@@ -103,7 +103,7 @@ func (bcc *BaseCredsContext) UpdateChildren() error {
 func (bcc *BaseCredsContext) CallerIdentity() (out *sts.GetCallerIdentityOutput, err error) {
   out, err = sts.New(bcc.stsSession).GetCallerIdentity(&sts.GetCallerIdentityInput{})
   if err != nil {
-	fmt.Fprintln(os.Stderr, err.Error())
+	fmt.Fprintln(os.Stderr, "Couldn't GetCallerIdentity with user %s: %s",  bcc.name, err.Error())
   } else {
     fmt.Fprintln(os.Stderr, out)
   }
@@ -115,6 +115,7 @@ func (bcc *BaseCredsContext) AddRoles(roles []string) error {
     return nil
   }
   first_role := roles[0]
+  fmt.Fprintf(os.Stderr,"AddRoles: bcc %s adding role %s\n", bcc.name, first_role)
   bcc.mux.Lock()
   existing_role_cxt, ok := bcc.subContexts[first_role]
   bcc.mux.Unlock()
@@ -127,8 +128,10 @@ func (bcc *BaseCredsContext) AddRoles(roles []string) error {
   }
   if err := new_context.Update(bcc.stsSession); err != nil {
     return fmt.Errorf("Couldn't update session for new role '%s': %s", first_role, err.Error())
+  } else {
+    fmt.Fprintf(os.Stderr, "AddRoles: bcc %s created new bcc for %s and updated session\n",bcc.name, new_context.name )
   }
-	if _ , err := bcc.CallerIdentity(); err != nil {
+	if _ , err := new_context.CallerIdentity(); err != nil {
     return fmt.Errorf("Couldn't GetCallerIdentity on role %s: %s", new_context.name, err.Error())
   }
   bcc.mux.Lock()
@@ -193,7 +196,7 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
     return err
   }
   creds := credentials.NewCredentials(&TempCredentialsProvider{output.Credentials})
-	sess,err := session.NewSession( pcc.sourceSession.Config, &aws.Config{ Credentials: pcc.stsCredentials},)
+	sess,err := session.NewSession( pcc.sourceSession.Config, &aws.Config{ Credentials: creds},)
   if err != nil {
     return err
   }
@@ -277,10 +280,10 @@ func (cm *CredsManager) GetProfileRequest(w http.ResponseWriter, r *http.Request
 			fmt.Fprintln(w, "No such profile", profilename, "has yet been loaded.  This does not necessarily mean it is not defined, and will be loaded automatically if used for a role")
 			return
 		}
-		result := new(struct{ Name string ; Roles []string}) // more fields? separate with ;
+		result := new(struct{ Name string ; Roles map[string]interface{}) // more fields? separate with ;
 		result.Name = pcc.name
     children := pcc.GetSubContexts()
-    result.Roles = make([]string, len(children))
+    result.Roles = make(map[string]{}interface, len(children))
 		for i, child := range children {
       result.Roles[i] = child.GetName()
     }
@@ -410,17 +413,21 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
       sourceSession: profile_session,
 	  }
   } else {
-    // if it exists already we have only to update the session token and kickoff an update to the tree of roles to update their sessions as well
+    // if it exists already we have only to update the session token , if we got a new one, 
+    // and kickoff an update to the tree of roles to update their sessions as well
     already_added = true
   }
-	if err := pcc.STSSession(data.Token); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, "Failed to get session credentials:", err.Error())
-		return
-	} else {
-    fmt.Fprintf(os.Stderr, "Successfully got session credentials for profile %s, token %s\n", profilename, data.Token)
+  if ! already_added || len(data.Token) == 6 {
+	  if err := pcc.STSSession(data.Token); err != nil {
+		  w.WriteHeader(http.StatusInternalServerError)
+		  fmt.Fprintln(w, "Failed to get session credentials:", err.Error())
+		  return
+	  } else {
+      fmt.Fprintf(os.Stderr, "Successfully got session credentials for profile %s, token %s\n", profilename, data.Token)
+    }
+  } else {
+    fmt.Fprintf(os.Stderr, "Existing session credentials retained for profile %s\n", profilename)
   }
-	fmt.Fprintln(os.Stderr, pcc.stsCredentials) // TODO: remove this dump of creds!
   if ! already_added {
 	  if err := cm.AddProfile(pcc); err != nil {
 		  w.WriteHeader(http.StatusInternalServerError)
