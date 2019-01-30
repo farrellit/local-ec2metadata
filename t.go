@@ -55,7 +55,8 @@ type BaseCredsContext struct {
   stsCredentials *credentials.Credentials // this is for the metadata endpoint primarily, from .Get() which will autorenew, and .ExpiresAt() tells when it expires if that's missing
 	stsSession     *session.Session         // this is a session from the stsCredentials.
 	mux            sync.Mutex               // all the following MUST be protected with this mutex
-  SubContexts map[string]CredsContext `json:"Roles"`// role arn -> credsContext
+  // Roles       []CredsContext           // if the nest bothers you, keeping this up to date might be somewhat easier
+  SubContexts map[string]CredsContext `json:"Roles"` //otherwise, this is just redundant becouause key == .Name
 }
 
 // so that it's avail from the CredsContext perspective
@@ -76,24 +77,24 @@ func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
   bcc.stsSession = sess
   bcc.stsCredentials = credentials
   bcc.mux.Unlock()
-  return bcc.UpdateChildren()
+  return bcc.UpdateSubContexts()
 }
 
-func (bcc *BaseCredsContext) GetSubContexts() (children []CredsContext) {
-  children = make([]CredsContext,len(bcc.SubContexts))
+func (bcc *BaseCredsContext) GetSubContexts() (subs []CredsContext) {
+  subs = make([]CredsContext,len(bcc.SubContexts))
   i:=0
   bcc.mux.Lock()
-  for _, child := range bcc.SubContexts {
-    children[i] = child
+  for _, sub := range bcc.SubContexts {
+    subs[i] =sub
   }
   bcc.mux.Unlock()
   return
 }
 
-func (bcc *BaseCredsContext) UpdateChildren() error {
-  children := bcc.GetSubContexts()
-  for _, child := range children {
-    if err := child.Update(bcc.stsSession); err != nil {
+func (bcc *BaseCredsContext) UpdateSubContexts() error {
+  subs := bcc.GetSubContexts()
+  for _, sub := range subs {
+    if err := sub.Update(bcc.stsSession); err != nil {
       return err
     }
   }
@@ -207,7 +208,7 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
   if _, err := pcc.CallerIdentity(); err != nil {
     return err
   }
-	return pcc.UpdateChildren()
+	return pcc.UpdateSubContexts()
 }
 
 ////// CredentialsManager handles sets of creds contexts hierarchies
@@ -494,4 +495,3 @@ func (bcc *BaseCredsContext)GetMetadataCredentials(path []string) (*MetadataResp
     Expiration: time.Now().UTC().Format(time_format), //vexp.Format(time_format),
   }, nil
 }
-
