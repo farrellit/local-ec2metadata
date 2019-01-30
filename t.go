@@ -51,23 +51,23 @@ type CredsContext interface {
 }
 
 type BaseCredsContext struct {
-  name string
+  Name string
   stsCredentials *credentials.Credentials // this is for the metadata endpoint primarily, from .Get() which will autorenew, and .ExpiresAt() tells when it expires if that's missing
 	stsSession     *session.Session         // this is a session from the stsCredentials.
 	mux            sync.Mutex               // all the following MUST be protected with this mutex
-  subContexts map[string]CredsContext // role arn -> credsContext
+  SubContexts map[string]CredsContext `json:"Roles"`// role arn -> credsContext
 }
 
 // so that it's avail from the CredsContext perspective
 func (bcc *BaseCredsContext) GetName() string {
-  return bcc.name
+  return bcc.Name
 }
 
 func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
   /* if source_sess == nil {
-    return fmt.Errorf("%s: couldn't update: source_sess was nil", bcc.name)
+    return fmt.Errorf("%s: couldn't update: source_sess was nil", bcc.Name)
   } */
-  credentials := stscreds.NewCredentials(source_sess,bcc.name)
+  credentials := stscreds.NewCredentials(source_sess,bcc.Name)
   sess, err := session.NewSession(&aws.Config{Credentials: credentials})
   if err != nil {
     return err
@@ -80,10 +80,10 @@ func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
 }
 
 func (bcc *BaseCredsContext) GetSubContexts() (children []CredsContext) {
-  children = make([]CredsContext,len(bcc.subContexts))
+  children = make([]CredsContext,len(bcc.SubContexts))
   i:=0
   bcc.mux.Lock()
-  for _, child := range bcc.subContexts {
+  for _, child := range bcc.SubContexts {
     children[i] = child
   }
   bcc.mux.Unlock()
@@ -103,7 +103,7 @@ func (bcc *BaseCredsContext) UpdateChildren() error {
 func (bcc *BaseCredsContext) CallerIdentity() (out *sts.GetCallerIdentityOutput, err error) {
   out, err = sts.New(bcc.stsSession).GetCallerIdentity(&sts.GetCallerIdentityInput{})
   if err != nil {
-	fmt.Fprintln(os.Stderr, "Couldn't GetCallerIdentity with user %s: %s",  bcc.name, err.Error())
+	fmt.Fprintln(os.Stderr, "Couldn't GetCallerIdentity with user %s: %s",  bcc.Name, err.Error())
   } else {
     fmt.Fprintln(os.Stderr, out)
   }
@@ -115,27 +115,27 @@ func (bcc *BaseCredsContext) AddRoles(roles []string) error {
     return nil
   }
   first_role := roles[0]
-  fmt.Fprintf(os.Stderr,"AddRoles: bcc %s adding role %s\n", bcc.name, first_role)
+  fmt.Fprintf(os.Stderr,"AddRoles: bcc %s adding role %s\n", bcc.Name, first_role)
   bcc.mux.Lock()
-  existing_role_cxt, ok := bcc.subContexts[first_role]
+  existing_role_cxt, ok := bcc.SubContexts[first_role]
   bcc.mux.Unlock()
   if ok {
     return existing_role_cxt.AddRoles(roles[1:])
   }
   new_context := &BaseCredsContext{
-      name: first_role,
-      subContexts:   make(map[string]CredsContext),
+      Name: first_role,
+      SubContexts:   make(map[string]CredsContext),
   }
   if err := new_context.Update(bcc.stsSession); err != nil {
     return fmt.Errorf("Couldn't update session for new role '%s': %s", first_role, err.Error())
   } else {
-    fmt.Fprintf(os.Stderr, "AddRoles: bcc %s created new bcc for %s and updated session\n",bcc.name, new_context.name )
+    fmt.Fprintf(os.Stderr, "AddRoles: bcc %s created new bcc for %s and updated session\n",bcc.Name, new_context.Name )
   }
 	if _ , err := new_context.CallerIdentity(); err != nil {
-    return fmt.Errorf("Couldn't GetCallerIdentity on role %s: %s", new_context.name, err.Error())
+    return fmt.Errorf("Couldn't GetCallerIdentity on role %s: %s", new_context.Name, err.Error())
   }
   bcc.mux.Lock()
-  bcc.subContexts[first_role] = new_context
+  bcc.SubContexts[first_role] = new_context
   bcc.mux.Unlock()
   return new_context.AddRoles(roles[1:])
 }
@@ -247,10 +247,10 @@ func NewCredsManager() (cm *CredsManager) {
 func (cm *CredsManager) AddProfile(pcc *ProfileCredsContext) error {
 	cm.mux.Lock()
 	defer cm.mux.Unlock()
-	if _, ok := cm.profiles[pcc.name]; ok {
-		return fmt.Errorf("Profile '%s' already exists in credentials manager", pcc.name)
+	if _, ok := cm.profiles[pcc.Name]; ok {
+		return fmt.Errorf("Profile '%s' already exists in credentials manager", pcc.Name)
 	}
-	cm.profiles[pcc.name] = pcc
+	cm.profiles[pcc.Name] = pcc
 	return nil
 }
 
@@ -280,14 +280,7 @@ func (cm *CredsManager) GetProfileRequest(w http.ResponseWriter, r *http.Request
 			fmt.Fprintln(w, "No such profile", profilename, "has yet been loaded.  This does not necessarily mean it is not defined, and will be loaded automatically if used for a role")
 			return
 		}
-		result := new(struct{ Name string ; Roles map[string]interface{}) // more fields? separate with ;
-		result.Name = pcc.name
-    children := pcc.GetSubContexts()
-    result.Roles = make(map[string]{}interface, len(children))
-		for i, child := range children {
-      result.Roles[i] = child.GetName()
-    }
-    if data, err := json.Marshal(result); err != nil {
+    if data, err := json.Marshal(pcc); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintln(w, "Couldn't marshal result (this is a server-side programming error):", err.Error)
 		} else {
@@ -407,8 +400,8 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
 	  }
 	  pcc = &ProfileCredsContext{
 		  BaseCredsContext: BaseCredsContext{
-        name:          profilename,
-        subContexts:   make(map[string]CredsContext),
+        Name:          profilename,
+        SubContexts:   make(map[string]CredsContext),
       },
       sourceSession: profile_session,
 	  }
@@ -443,7 +436,7 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
       w.WriteHeader(http.StatusOK)
     }
 	}
-  fmt.Fprintf(os.Stderr, "%#v: result %s already_added %b\n", pcc, result, already_added)
+  //fmt.Fprintf(os.Stderr, "%#v: result %s already_added %b\n", pcc, result, already_added)
 	return // success! result has been set to true already.
 }
 
@@ -472,18 +465,18 @@ type MetadataResponse struct {
 func (bcc *BaseCredsContext)GetMetadataCredentials(path []string) (*MetadataResponse, error) {
   if len(path) > 0 {
     bcc.mux.Lock()
-    subc, ok := bcc.subContexts[path[0]]
+    subc, ok := bcc.SubContexts[path[0]]
     bcc.mux.Unlock()
     if ok {
       return subc.GetMetadataCredentials(path[1:])
     } else {
-      return nil, fmt.Errorf("Role %s not found under %s", path[0], bcc.name)
+      return nil, fmt.Errorf("Role %s not found under %s", path[0], bcc.Name)
     }
   }
   /* todo: debug
   vexp, err := bcc.stsCredentials.ExpiresAt()
   if err != nil { // TODO: make this work for profiles if it doesn't already, so they can be exposed too if desired
-    return nil, fmt.Errorf("Role %s: Failed to get stsCredentials.ExpiresAt : %s", bcc.name, err.Error())
+    return nil, fmt.Errorf("Role %s: Failed to get stsCredentials.ExpiresAt : %s", bcc.Name, err.Error())
   }
   */
   v, err := bcc.stsCredentials.Get()
