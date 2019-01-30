@@ -47,6 +47,7 @@ type CredsContext interface {
   AddRoles([]string) error // recursive (across objects) function; returns new_role_context.AddRoles(myroles[1:])
   GetMetadataCredentials([]string) (*MetadataResponse, error) // for metadata requests
   Update(*session.Session) error
+  GetName() string
 }
 
 type BaseCredsContext struct {
@@ -55,6 +56,11 @@ type BaseCredsContext struct {
 	stsSession     *session.Session         // this is a session from the stsCredentials.
 	mux            sync.Mutex               // all the following MUST be protected with this mutex
   subContexts map[string]CredsContext // role arn -> credsContext
+}
+
+// so that it's avail from the CredsContext perspective
+func (bcc *BaseCredsContext) GetName() string {
+  return bcc.name
 }
 
 func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
@@ -73,23 +79,35 @@ func (bcc *BaseCredsContext) Update(source_sess *session.Session) error {
   return bcc.UpdateChildren()
 }
 
-func (bcc *BaseCredsContext) UpdateChildren() error {
-  if bcc.stsSession == nil {
-    return nil
-  }
-  children := make([]CredsContext,len(bcc.subContexts))
+func (bcc *BaseCredsContext) GetSubContexts() (children []CredsContext) {
+  children = make([]CredsContext,len(bcc.subContexts))
   i:=0
   bcc.mux.Lock()
   for _, child := range bcc.subContexts {
     children[i] = child
   }
   bcc.mux.Unlock()
+  return
+}
+
+func (bcc *BaseCredsContext) UpdateChildren() error {
+  children := bcc.GetSubContexts()
   for _, child := range children {
     if err := child.Update(bcc.stsSession); err != nil {
       return err
     }
   }
   return nil
+}
+
+func (bcc *BaseCredsContext) CallerIdentity() (out *sts.GetCallerIdentityOutput, err error) {
+  out, err = sts.New(bcc.stsSession).GetCallerIdentity(&sts.GetCallerIdentityInput{})
+  if err != nil {
+	fmt.Fprintln(os.Stderr, err.Error())
+  } else {
+    fmt.Fprintln(os.Stderr, out)
+  }
+  return
 }
 
 func (bcc *BaseCredsContext) AddRoles(roles []string) error {
@@ -110,12 +128,9 @@ func (bcc *BaseCredsContext) AddRoles(roles []string) error {
   if err := new_context.Update(bcc.stsSession); err != nil {
     return fmt.Errorf("Couldn't update session for new role '%s': %s", first_role, err.Error())
   }
-	stsc := sts.New(new_context.stsSession)
-	out, err := stsc.GetCallerIdentity(&sts.GetCallerIdentityInput{}) // idk if I love this sync call, but it proves we have assumed for sure
-  if err != nil {
+	if _ , err := bcc.CallerIdentity(); err != nil {
     return fmt.Errorf("Couldn't GetCallerIdentity on role %s: %s", new_context.name, err.Error())
   }
-	fmt.Fprintln(os.Stderr, out)
   bcc.mux.Lock()
   bcc.subContexts[first_role] = new_context
   bcc.mux.Unlock()
@@ -186,6 +201,9 @@ func (pcc *ProfileCredsContext) STSSession(token string) error {
   pcc.stsCredentials = creds
 	pcc.stsSession = sess
   pcc.mux.Unlock()
+  if _, err := pcc.CallerIdentity(); err != nil {
+    return err
+  }
 	return pcc.UpdateChildren()
 }
 
@@ -259,9 +277,14 @@ func (cm *CredsManager) GetProfileRequest(w http.ResponseWriter, r *http.Request
 			fmt.Fprintln(w, "No such profile", profilename, "has yet been loaded.  This does not necessarily mean it is not defined, and will be loaded automatically if used for a role")
 			return
 		}
-		result := new(struct{ Name string }) // more fields? separate with ;
+		result := new(struct{ Name string ; Roles []string}) // more fields? separate with ;
 		result.Name = pcc.name
-		if data, err := json.Marshal(result); err != nil {
+    children := pcc.GetSubContexts()
+    result.Roles = make([]string, len(children))
+		for i, child := range children {
+      result.Roles[i] = child.GetName()
+    }
+    if data, err := json.Marshal(result); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintln(w, "Couldn't marshal result (this is a server-side programming error):", err.Error)
 		} else {
@@ -390,23 +413,13 @@ func (cm *CredsManager) PostProfileHandler(w http.ResponseWriter, r *http.Reques
     // if it exists already we have only to update the session token and kickoff an update to the tree of roles to update their sessions as well
     already_added = true
   }
-	if data.Token != "" {
-		mfa_serial, err := pcc.GetMFASerial()
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, "Couldn't list mfa devices:", err.Error())
-			return
-		} else if mfa_serial == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintln(w, "Bad Request: MFA Token provided, but no MFA Device Serial could be found under the profile.")
-			return
-		}
-	}
 	if err := pcc.STSSession(data.Token); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Failed to get session credentials:", err.Error())
 		return
-	}
+	} else {
+    fmt.Fprintf(os.Stderr, "Successfully got session credentials for profile %s, token %s\n", profilename, data.Token)
+  }
 	fmt.Fprintln(os.Stderr, pcc.stsCredentials) // TODO: remove this dump of creds!
   if ! already_added {
 	  if err := cm.AddProfile(pcc); err != nil {
