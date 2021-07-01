@@ -1,0 +1,56 @@
+<head>
+<title>EC2MetaData</title>
+<script src="https://cdn.jsdelivr.net/npm/vue/dist/vue.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vue-resource@1.5.1"></script>
+<script>
+window.endpoints = {
+  backend: "http://localhost:8001"
+}
+</script>
+<style>
+</style>
+</head>
+<body>
+<h1>EC2MetaData</h1>
+<div id='app'>
+<div class='contexts'>
+<h2>Auth Contexts</h2>
+<p class='help'>
+Auth Contexts provide a source for api credential materials, which themselves might be 
+based on prior credentials ( assuming a role from a profile or federated identity ).
+</p>
+<contexts>
+</contexts>
+</div><!-- contexts -->
+</div><!-- app -->
+
+
+<template id="contexts"> 
+<div class='contextlist' >
+<div v-for="key in contexts">
+<h3>{{key}}</h3>
+<contexts v-bind="contexts[key]"></contexts>
+</div>
+</div>
+</template >
+
+<script>
+Vue.component('contexts', {
+  template: '#contexts', 
+  data: function(){  return { contexts: [] } },
+  mounted: function(){ this.FetchContexts() },
+  methods: {
+    FetchContexts: function () {
+      var contexts= [];
+      this.$http.get(window.endpoints.backend + "/contexts")
+        .then(
+          response=>{ this.contexts= response.body; console.log(this.contexts) },
+          response=>{ alert("Error loading contexts: " + response.status, + ": " + response.statusText) }
+        )
+    },
+  }
+});
+new Vue({el:'#app'})
+</script>
+</body>
+</html>
